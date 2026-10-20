@@ -31,7 +31,10 @@ def _app_icon_path() -> Path | None:
 
 
 def _diag(app: QApplication) -> None:
-    """诊断日志：图标可用性 / 字体 / 打包环境，写入 %TEMP%\\blenderhub_diag.log。"""
+    """诊断快照：图标可用性 / 字体 / 打包环境，写入 %TEMP%\\blenderhub_diag.log。
+
+    仅在 BLENDERHUB_DEBUG=1 时调用（图标墨迹扫描要逐像素读图，正式启动不做）。
+    """
     lines = []
     lines.append(f"frozen={getattr(sys, 'frozen', False)}")
     try:
@@ -88,10 +91,7 @@ def _install_crash_log() -> None:
 
 def main() -> None:
     _install_crash_log()
-    try:
-        os.remove(os.path.join(os.environ.get("TEMP", "."), "blenderhub_start.log"))
-    except OSError:
-        pass
+    store.begin_session()
     store.ckpt("main-enter")
     app = QApplication(sys.argv)
     store.ckpt("qapp")
@@ -109,7 +109,8 @@ def main() -> None:
     store.ckpt("store-load")
     T.apply_theme(app, T.LIGHT if data["theme"] == "light" else T.DARK)
     store.ckpt("theme")
-    _diag(app)
+    if store.DEBUG:
+        _diag(app)
     store.ckpt("diag")
     window = MainWindow()
     store.ckpt("mw-done")

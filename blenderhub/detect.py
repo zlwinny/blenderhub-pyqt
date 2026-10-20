@@ -24,6 +24,7 @@ import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from .addon_store import canonical_category
 from .system_ops import find_blender_installs
 
 _SKIP_DIRS = {
@@ -121,7 +122,7 @@ class Snapshot:
         return [c for c, _ in sorted(seen.items(), key=lambda kv: (-kv[1], kv[0]))]
 
     def addon_chip_category(self, addon: Addon) -> str:
-        return _clean_category(addon.category) or "其他"
+        return canonical_category(_clean_category(addon.category))
 
 
 # ---------------------------------------------------------------- 安装

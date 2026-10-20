@@ -580,37 +580,6 @@ def _rounded_cover(pm: QPixmap, w: int, h: int, radius: int,
     return out
 
 
-class _ElideLabel(QLabel):
-    """单行标签：宽度不足时右侧省略号截断，用于卡片标题 / 路径 / meta。
-
-    sizeHint / minimumSizeHint 必须返回极小宽度，否则布局会按完整文本
-    宽度计算卡片最小宽度，四列网格放不下只能看到两列。
-    """
-
-    def __init__(self, text: str, text_role: str = "body", parent=None):
-        super().__init__(text, parent)
-        self.setProperty("textRole", text_role)
-        self._full = text
-
-    def sizeHint(self):
-        return QSize(24, super().sizeHint().height())
-
-    def minimumSizeHint(self):
-        return QSize(24, super().minimumSizeHint().height())
-
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
-        self._sync_elide()
-
-    def _sync_elide(self) -> None:
-        if not self._full:
-            return
-        elided = self.fontMetrics().elidedText(
-            self._full, Qt.TextElideMode.ElideRight, max(12, self.width()))
-        if elided != self.text():
-            self.setText(elided)
-
-
 class MediaCard(Card):
     """项目 / 插件卡：大图缩略区 + 标题 + 作者 + 标签 + 底部信息与操作。
 
@@ -675,9 +644,9 @@ class MediaCard(Card):
         bl = QVBoxLayout(body)
         bl.setContentsMargins(12, 10, 12, 10)
         bl.setSpacing(4)
-        bl.addWidget(_ElideLabel(name, "h2"))
+        bl.addWidget(ElidedLabel(name, "h2"))
         if sub:
-            bl.addWidget(_ElideLabel(sub, "muted"))
+            bl.addWidget(ElidedLabel(sub, "muted"))
         if chips:
             crow = QHBoxLayout()
             crow.setSpacing(5)
@@ -688,8 +657,8 @@ class MediaCard(Card):
         meta = QHBoxLayout()
         meta.setSpacing(6)
         if meta_left:
-            # 省略号标签 sizeHint 极小，必须给 stretch 权重才能吸收剩余宽度
-            meta.addWidget(_ElideLabel(meta_left, "muted2"), 1)
+            # Ignored 水平策略 + stretch 权重，剩余宽度才归它吸收
+            meta.addWidget(ElidedLabel(meta_left, "muted2"), 1)
         else:
             meta.addStretch(1)
         meta.addWidget(action)
@@ -1011,6 +980,35 @@ class _SegButton(QPushButton):
         return lay.minimumSize() if lay is not None else super().minimumSizeHint()
 
 
+def _row_button(text: str) -> QPushButton:
+    b = QPushButton(text)
+    b.setCheckable(True)
+    b.setCursor(Qt.CursorShape.PointingHandCursor)
+    return b
+
+
+def _fill_row(group: QButtonGroup, lay: QLayout, items: list,
+              make) -> list[QPushButton]:
+    """重建一行互斥按钮：清掉 group 里的旧按钮，按 items 逐个 make 后入组入列。
+
+    removeWidget 只解除布局管理，控件仍是子控件且可见；deleteLater 要等事件循环才
+    生效——期间旧按钮以默认尺寸 (640x480) 残留在原地，看起来就是「两块界面重叠」，
+    所以必须先 setParent(None) 立即脱离父级。
+    """
+    for b in group.buttons():
+        lay.removeWidget(b)
+        group.removeButton(b)
+        b.setParent(None)
+        b.deleteLater()
+    out: list[QPushButton] = []
+    for i, item in enumerate(items):
+        b = make(item)
+        group.addButton(b, i)
+        lay.addWidget(b)
+        out.append(b)
+    return out
+
+
 class Segmented(QWidget):
     """分段控件（胶囊容器 + 互斥项）。
 
@@ -1023,71 +1021,46 @@ class Segmented(QWidget):
     def __init__(self, items: list[tuple[str, str]], parent=None):
         super().__init__(parent)
         self._items = items
-        box = QFrame(self)
-        box.setObjectName("segbox")
-        lay = QHBoxLayout(box)
-        lay.setContentsMargins(3, 3, 3, 3)
-        lay.setSpacing(2)
+        self._box = QFrame(self)
+        self._box.setObjectName("segbox")
+        self._box_lay = QHBoxLayout(self._box)
+        self._box_lay.setContentsMargins(3, 3, 3, 3)
+        self._box_lay.setSpacing(2)
         outer = QHBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(box)
+        outer.addWidget(self._box)
         outer.addStretch(1)
 
         self._group = QButtonGroup(self)
         self._group.setExclusive(True)
-        self._buttons: list[QPushButton] = []
-        for i, (text, count) in enumerate(items):
-            b = _SegButton(self)
-            b.setCheckable(True)
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.setObjectName("segbtn")
-            inner = QHBoxLayout(b)
-            inner.setContentsMargins(10, 4, 10, 4)
-            inner.setSpacing(4)
-            lb = QLabel(text, b)
-            lb.setObjectName("seglabel")
-            cnt = QLabel(count, b)
-            cnt.setObjectName("segcount")
-            inner.addWidget(lb)
-            inner.addWidget(cnt)
-            self._group.addButton(b, i)
-            lay.addWidget(b)
-            self._buttons.append(b)
+        self._buttons = _fill_row(self._group, self._box_lay, items, self._make)
         self._buttons[0].setChecked(True)
         self._group.idClicked.connect(self.currentChanged.emit)
         self.refresh()
+
+    def _make(self, item: tuple[str, str]) -> _SegButton:
+        text, count = item
+        b = _SegButton(self)
+        b.setCheckable(True)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        b.setObjectName("segbtn")
+        inner = QHBoxLayout(b)
+        inner.setContentsMargins(10, 4, 10, 4)
+        inner.setSpacing(4)
+        lb = QLabel(text, b)
+        lb.setObjectName("seglabel")
+        cnt = QLabel(count, b)
+        cnt.setObjectName("segcount")
+        inner.addWidget(lb)
+        inner.addWidget(cnt)
+        return b
 
     def set_items(self, items: list[tuple[str, str]]) -> None:
         """按真实数据重建分段项（数量 / 文案动态变化）。"""
         if items == self._items:
             return
         self._items = items
-        box = self.findChild(QFrame, "segbox")
-        lay = box.layout()
-        for b in self._buttons:
-            lay.removeWidget(b)
-            self._group.removeButton(b)
-            # 同 ChipFilter.set_items：必须立即脱离父级，防止幽灵控件残留
-            b.setParent(None)
-            b.deleteLater()
-        self._buttons = []
-        for i, (text, count) in enumerate(items):
-            b = _SegButton(self)
-            b.setCheckable(True)
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.setObjectName("segbtn")
-            inner = QHBoxLayout(b)
-            inner.setContentsMargins(10, 4, 10, 4)
-            inner.setSpacing(4)
-            lb = QLabel(text, b)
-            lb.setObjectName("seglabel")
-            cnt = QLabel(count, b)
-            cnt.setObjectName("segcount")
-            inner.addWidget(lb)
-            inner.addWidget(cnt)
-            self._group.addButton(b, i)
-            lay.addWidget(b)
-            self._buttons.append(b)
+        self._buttons = _fill_row(self._group, self._box_lay, items, self._make)
         self._buttons[0].setChecked(True)
         self.refresh()
 
@@ -1098,7 +1071,7 @@ class Segmented(QWidget):
 
     def refresh(self) -> None:
         t = T.theme()
-        self.findChild(QFrame, "segbox").setStyleSheet(  # type: ignore[union-attr]
+        self._box.setStyleSheet(
             f"#segbox {{ background: {t.bg_raised}; border: 1px solid {t.border}; "
             f"border-radius: {T.RADIUS_MD}px; }}"
         )
@@ -1192,17 +1165,10 @@ class ChipFilter(QWidget):
     def __init__(self, items: list[str], parent=None):
         super().__init__(parent)
         self._items = items
-        lay = FlowLayout(self, 6)
+        self._lay = FlowLayout(self, 6)
         self._group = QButtonGroup(self)
         self._group.setExclusive(True)
-        self._buttons = []
-        for i, text in enumerate(items):
-            b = QPushButton(text)
-            b.setCheckable(True)
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            self._group.addButton(b, i)
-            lay.addWidget(b)
-            self._buttons.append(b)
+        self._buttons = _fill_row(self._group, self._lay, items, _row_button)
         self._buttons[0].setChecked(True)
         self._group.idClicked.connect(self.currentChanged.emit)
         self.refresh()
@@ -1212,23 +1178,7 @@ class ChipFilter(QWidget):
         if items == self._items:
             return
         self._items = items
-        lay = self.layout()
-        for b in self._buttons:
-            lay.removeWidget(b)
-            self._group.removeButton(b)
-            # removeWidget 只解除布局管理，控件仍是子控件且可见；
-            # deleteLater 又要等事件循环才生效——期间旧胶囊会以默认尺寸
-            # (640x480) 残留在原地，看起来就是「两块界面重叠」。必须立即脱离。
-            b.setParent(None)
-            b.deleteLater()
-        self._buttons = []
-        for i, text in enumerate(items):
-            b = QPushButton(text)
-            b.setCheckable(True)
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            self._group.addButton(b, i)
-            lay.addWidget(b)
-            self._buttons.append(b)
+        self._buttons = _fill_row(self._group, self._lay, items, _row_button)
         self._buttons[0].setChecked(True)
         self.refresh()
 
@@ -1259,14 +1209,7 @@ class VerticalNav(QWidget):
         lay.setSpacing(2)
         self._group = QButtonGroup(self)
         self._group.setExclusive(True)
-        self._buttons = []
-        for i, text in enumerate(items):
-            b = QPushButton(text)
-            b.setCheckable(True)
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            self._group.addButton(b, i)
-            lay.addWidget(b)
-            self._buttons.append(b)
+        self._buttons = _fill_row(self._group, lay, items, _row_button)
         self._buttons[0].setChecked(True)
         self._group.idClicked.connect(self.currentChanged.emit)
         self.refresh()

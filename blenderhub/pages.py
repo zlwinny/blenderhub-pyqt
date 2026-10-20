@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import re
 import time
+from collections.abc import Callable
 from datetime import datetime
 
 from PyQt6.QtCore import QPoint, Qt, pyqtSignal, QThreadPool, QTimer
@@ -40,9 +41,11 @@ from . import store
 from . import theme as T
 from .addon_dialogs import (
     PanDownloadDialog,
+    ReleasePickerDialog,
     StoreDetailDialog,
     StoreLoginDialog,
     confirm,
+    notice,
 )
 from .addon_store import (
     CATEGORY_CHIPS,
@@ -60,6 +63,8 @@ from .addon_store import (
     cache_root,
     has_net_deps,
     install_zip,
+    match_norm,
+    norm_name,
 )
 from .icons import pixmap
 from .widgets import (
@@ -132,6 +137,17 @@ def _menu(parent, items: list[str], on_pick) -> QMenu:
     return m
 
 
+def _card_actions(*btns: QWidget) -> QWidget:
+    """卡片右下角的操作区：多个按钮并排（如「目录」+「卸载」）。"""
+    box = QWidget()
+    lay = QHBoxLayout(box)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(4)
+    for b in btns:
+        lay.addWidget(b)
+    return box
+
+
 def _clear_layout(lay) -> None:
     """清空布局内所有子控件（删除而非隐藏，保证下次重建干净）。"""
     while lay.count():
@@ -186,6 +202,58 @@ def _grid_cols(width: int, card_w: int = _CARD_W, gap: int = _GRID_GAP) -> int:
     """按页面可用宽度算卡片列数，避免固定列数在窄窗口下把右侧挤出可视区。"""
     avail = max(1, width - 2 * _PAGE_MARGIN)
     return max(1, min(6, (avail + gap) // (card_w + gap)))
+
+
+class CardGrid:
+    """卡片网格页的外壳：列数随页面宽度自适应，带空态与 resize 防抖。
+
+    页面只管造卡片（reset → add… → rebuild），重排与防抖不再各写一份。
+    """
+
+    def __init__(self, owner: QWidget, host_lay: QVBoxLayout,
+                 compact: Callable[[], bool] | None = None):
+        self._owner = owner
+        self._compact = compact
+        self.widgets: list[QWidget] = []
+        self.empty: QWidget | None = None
+        self._cols = 0
+        self.grid = QGridLayout()
+        self.grid.setSpacing(_GRID_GAP)
+        host = QWidget()
+        host.setLayout(self.grid)
+        host_lay.addWidget(host)
+        host_lay.addStretch(1)
+        self._timer = QTimer(owner)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(60)
+        self._timer.timeout.connect(self.arrange)
+
+    def reset(self) -> None:
+        """丢弃上一批卡片，准备整页重建。"""
+        _clear_layout(self.grid)
+        self.widgets = []
+        self.empty = None
+
+    def add(self, w: QWidget) -> None:
+        w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.widgets.append(w)
+
+    def rebuild(self, empty: QWidget | None = None) -> None:
+        self.empty = empty
+        self.arrange(force=True)
+
+    def arrange(self, force: bool = False) -> None:
+        cols = _grid_cols(self._owner.width())
+        if not force and cols == self._cols:
+            return
+        self._cols = cols
+        compact = True if self._compact is None else self._compact()
+        _regrid(self.grid, self.widgets, self.empty, cols, compact=compact)
+
+    def on_resize(self) -> None:
+        if (self.widgets or self.empty is not None) \
+                and _grid_cols(self._owner.width()) != self._cols:
+            self._timer.start()
 
 
 class _MoreLink(QLabel):
@@ -708,7 +776,8 @@ class VersionsPage(QWidget):
         if not snap.installs:
             self._list_lay.addWidget(EmptyState(
                 "未检测到 Blender 安装",
-                "扫描了常见安装目录与 PATH · 拖入安装包或点击「添加版本」导入",
+                "扫描了常见安装目录与 PATH · 点「添加版本」从镜像站在线下载，"
+                "或把本地安装包拖进来",
             ))
             return
         for inst in snap.installs:
@@ -761,7 +830,7 @@ class VersionsPage(QWidget):
             self.window().show_toast(f"{name}：未找到安装目录", "info")
 
     def _version_menu(self, name: str, btn) -> None:
-        m = _menu(self, ["设为默认"],
+        m = _menu(self, ["设为默认", "卸载"],
                   lambda pick: self._version_pick(name, pick))
         m.exec(btn.mapToGlobal(QPoint(0, btn.height())))
 
@@ -776,6 +845,41 @@ class VersionsPage(QWidget):
             self.window().set_default_version(label_text)
             self.window().show_toast(
                 f"已将 {name}（{label_text}）设为默认版本", "ok")
+        elif pick == "卸载":
+            self._uninstall(inst)
+
+    def _uninstall(self, inst: detect.Install) -> None:
+        """卸载版本：只删本应用装进安装目录里的副本。
+
+        护栏沿用第一版教训——早先实现对扫描到的任意安装直接递归删除，
+        会把 Program Files / Steam 里的 Blender 整个删掉。
+        """
+        target = os.path.dirname(os.path.abspath(inst.exe))
+        roots = store.managed_roots()
+        if not any(ops.is_under(r, target) for r in roots):
+            notice(
+                self, "无法卸载外部安装",
+                f"{inst.name} 位于本应用安装目录之外：\n\n{target}\n\n"
+                "它由系统安装包、Steam 或手动解压而来，BlenderHub 不会代删。\n"
+                f"如需移除，请自行处理，或在「设置」里把安装目录设为其所在目录："
+                f"{'、'.join(roots) or '（尚未设置安装目录）'}",
+            )
+            return
+        size = detect.fmt_size(inst.size_bytes)
+        if not confirm(
+            self, "卸载 Blender 版本",
+            f"确定卸载 {inst.name}（{size}）吗？\n{target}\n\n"
+            "整个目录会移入回收站，之后可从回收站恢复。",
+            ok_text="移入回收站",
+        ):
+            return
+        ok, msg = ops.recycle_paths([target])
+        if not ok:
+            self.window().show_toast(f"卸载失败：{msg}", "error")
+            return
+        self.window().rescan()
+        self.window().show_toast(
+            f"已卸载 {inst.name}（{size} 移入回收站，可恢复）", "ok")
 
     def _rescan(self) -> None:
         self._check_btn.set_busy(True)
@@ -791,12 +895,25 @@ class VersionsPage(QWidget):
         )
 
     def _add_version(self) -> None:
+        """在线选版本下载并装好；本地压缩包走对话框里的「本地导入」或直接拖进来。"""
+        dlg = ReleasePickerDialog(store.load()["install_dir"], self)
+        dlg.installed.connect(self._on_online_installed)
+        dlg.import_requested.connect(self._pick_local)
+        dlg.exec()
+
+    def _pick_local(self) -> None:
         with ND.guard_native_dialog(self):
             path, _ = QFileDialog.getOpenFileName(
                 self, "选择 Blender 安装包", "", "压缩包 (*.zip *.tar.xz *.tar.gz)"
             )
         if path:
             self._import_archive(path)
+
+    def _on_online_installed(self, version: str, dest: str) -> None:
+        if dest:
+            store.remember_managed_root(dest)
+        self.window().rescan()
+        self.window().show_toast(f"已安装 Blender {version} 到 {dest}", "ok")
 
     def _on_drop(self, paths: list[str]) -> None:
         if paths:
@@ -808,6 +925,8 @@ class VersionsPage(QWidget):
         if not ok:
             self.window().show_toast(msg, "error")
             return
+        # 登记为托管根：这份副本之后才允许被「卸载」删掉
+        store.remember_managed_root(dest)
         self.window().rescan()
         snap = self.window()._snapshot
         self.window().show_toast(
@@ -849,19 +968,7 @@ class ProjectsPage(QWidget):
         self._chips.currentChanged.connect(self._on_chip)
         lay.addWidget(self._chips)
 
-        self._grid = QGridLayout()
-        self._grid.setSpacing(_GRID_GAP)
-        grid_host = QWidget()
-        grid_host.setLayout(self._grid)
-        lay.addWidget(grid_host)
-        lay.addStretch(1)
-        self._grid_widgets: list[QWidget] = []
-        self._empty: QWidget | None = None
-        self._cols = 0
-        self._grid_timer = QTimer(self)
-        self._grid_timer.setSingleShot(True)
-        self._grid_timer.setInterval(60)
-        self._grid_timer.timeout.connect(self._arrange_grid)
+        self._grid = CardGrid(self, lay)
         self._thumb_targets: dict[str, MediaCard] = {}
         self._thumb_hooked = False
         self._sel: set[str] = set()
@@ -875,18 +982,9 @@ class ProjectsPage(QWidget):
         self._sc_esc.activated.connect(self._exit_select_mode)
 
     # -- 布局 --------------------------------------------------------
-    def _arrange_grid(self, force: bool = False) -> None:
-        cols = _grid_cols(self.width())
-        if not force and cols == self._cols:
-            return
-        self._cols = cols
-        _regrid(self._grid, self._grid_widgets, self._empty, cols)
-
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        if (self._grid_widgets or self._empty is not None) \
-                and _grid_cols(self.width()) != self._cols:
-            self._grid_timer.start()
+        self._grid.on_resize()
 
     # -- 真实数据 ----------------------------------------------------
     def reload(self, snap: detect.Snapshot) -> None:
@@ -907,20 +1005,17 @@ class ProjectsPage(QWidget):
         self._chips.set_items(items)
         self._chip_idx = 0
 
-        _clear_layout(self._grid)
+        self._grid.reset()
         self._cards: list[tuple[QWidget, str, str, str, float]] = []
         self._thumb_targets = {}
-        self._grid_widgets = []
-        self._empty = None
         # 上一次多选里已被删除 / 移动的项目不再参与选择态
         live = {p.path for p in snap.projects}
         self._sel = {p for p in self._sel if p in live}
         if not snap.projects:
-            self._empty = EmptyState(
+            self._grid.rebuild(EmptyState(
                 "未检测到 .blend 项目",
                 "扫描桌面 / 文档 / 下载 / 安装目录与 Blender 最近打开记录",
-            )
-            self._arrange_grid(force=True)
+            ))
             self._sync_sel_ui()
             return
         for i, p in enumerate(snap.projects):
@@ -939,14 +1034,13 @@ class ProjectsPage(QWidget):
             )
             card.set_selectable(self._select_mode)
             card.set_selected(p.path in self._sel)
-            card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            self._grid_widgets.append(card)
+            self._grid.add(card)
             self._cards.append((card, p.name, p.path, p.version, p.mtime))
             self._thumb_targets[p.path] = card
         new = NewCard("新建项目")
         new.clicked.connect(self._new_project)
-        self._grid_widgets.append(new)
-        self._arrange_grid(force=True)
+        self._grid.add(new)
+        self._grid.rebuild()
         self._request_thumbs()
         self._sync_sel_ui()
 
@@ -979,7 +1073,7 @@ class ProjectsPage(QWidget):
             ok_search = not key or key in name.lower() or key in path.lower()
             _set_filtered(card, ok_search and self._chip_match(card))
         # 重新紧凑排列：隐藏卡片不占网格位
-        self._arrange_grid(force=True)
+        self._grid.arrange(force=True)
         # 可见集合变了，「全选 / 取消全选」的判定要跟着更新
         if self._select_mode:
             self._sync_sel_ui()
@@ -1167,40 +1261,18 @@ class AddonsPage(QWidget):
         self._chips.currentChanged.connect(self._on_chip)
         lay.addWidget(self._chips)
 
-        self._grid = QGridLayout()
-        self._grid.setSpacing(_GRID_GAP)
-        grid_host = QWidget()
-        grid_host.setLayout(self._grid)
-        lay.addWidget(grid_host)
-        lay.addStretch(1)
-        self._grid_widgets: list[QWidget] = []
-        self._empty: QWidget | None = None
-        self._cols = 0
-        self._grid_timer = QTimer(self)
-        self._grid_timer.setSingleShot(True)
-        self._grid_timer.setInterval(60)
-        self._grid_timer.timeout.connect(self._arrange_grid)
+        # 在线目录可达 240 张卡，隐藏/恢复全量重排要数秒，只在本地视图紧凑排列
+        self._grid = CardGrid(self, lay, compact=lambda: self._mode == "local")
 
     # -- 布局 --------------------------------------------------------
-    def _arrange_grid(self, force: bool = False) -> None:
-        cols = _grid_cols(self.width())
-        if not force and cols == self._cols:
-            return
-        self._cols = cols
-        # 在线目录可达 240 张卡，隐藏/恢复全量重排要数秒，保留原占位行为
-        _regrid(self._grid, self._grid_widgets, self._empty, cols,
-                compact=self._mode == "local")
-
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        if (self._grid_widgets or self._empty is not None) \
-                and _grid_cols(self.width()) != self._cols:
-            self._grid_timer.start()
+        self._grid.on_resize()
 
     # -- 真实数据 ----------------------------------------------------
     def reload(self, snap: detect.Snapshot) -> None:
         self._installed_names = {
-            a.name.strip().lower() for a in snap.addons if a.name
+            k for k in (norm_name(a.name) for a in snap.addons) if k
         }
         store_ = self._store
         self._ensure_hooks()
@@ -1231,19 +1303,20 @@ class AddonsPage(QWidget):
         self._chips.set_items(items)
         self._chip_idx = 0
 
-        _clear_layout(self._grid)
+        self._grid.reset()
         self._cards: list[tuple[QWidget, detect.Addon]] = []
-        self._grid_widgets = []
-        self._empty = None
         if not snap.addons:
-            self._empty = EmptyState(
+            self._grid.rebuild(EmptyState(
                 "未检测到已安装插件",
                 "扫描各 Blender 安装与用户配置目录的 scripts/addons 与 extensions",
-            )
-            self._arrange_grid(force=True)
+            ))
             return
         for i, a in enumerate(snap.addons):
             dir_btn = Button("目录", "ghost", "sm", icon_name="folder")
+            un_btn = IconButton(
+                "trash", "ghost",
+                tip="卸载：把插件目录移入回收站" if not a.builtin
+                else "卸载 Blender 自带插件（可能影响自带功能）")
             chips = [(snap.addon_chip_category(a), "info"),
                      (f"Blender {a.blender_ver}", "info")]
             # 随发行包自带的内置插件在线市场没有对应条目、拿不到封面；
@@ -1254,23 +1327,23 @@ class AddonsPage(QWidget):
                 a.name,
                 f"by {a.author or '未知作者'} · v{a.version or '?'}",
                 detect.fmt_size(a.size_bytes),
-                dir_btn,
+                _card_actions(dir_btn, un_btn),
                 thumb=_THUMB_KEYS[i % 6], thumb_icon="puzzle",
                 chips=chips,
             )
             dir_btn.clicked.connect(
                 lambda _c=False, p=a.path, n=a.name: self._open_addon_dir(n, p)
             )
+            un_btn.clicked.connect(lambda _c=False, x=a: self._uninstall(x))
             card.clicked.connect(
                 lambda _c=False, p=a.path, n=a.name: self._open_addon_dir(n, p)
             )
-            card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            self._grid_widgets.append(card)
+            self._grid.add(card)
             self._cards.append((card, a))
         new = NewCard("从 ZIP 安装", icon_name="plus")
         new.clicked.connect(self._install_from_zip)
-        self._grid_widgets.append(new)
-        self._arrange_grid(force=True)
+        self._grid.add(new)
+        self._grid.rebuild()
         self._apply_local_thumbs()
 
     def _apply_local_thumbs(self) -> None:
@@ -1316,7 +1389,7 @@ class AddonsPage(QWidget):
         for card, addon in self._cards:
             ok = not key or key in addon.name.lower() or key in (addon.author or "").lower()
             _set_filtered(card, ok and self._chip_match(addon))
-        self._arrange_grid(force=True)
+        self._grid.arrange(force=True)
 
     def _chip_match(self, addon: detect.Addon) -> bool:
         if self._chip_idx <= 0:
@@ -1344,6 +1417,27 @@ class AddonsPage(QWidget):
             self.window().show_toast(f"已打开 {name} 目录：{msg}", "ok")
         else:
             self.window().show_toast(f"{name}：目录不存在", "info")
+
+    def _uninstall(self, addon: detect.Addon) -> None:
+        """卸载 = 把插件目录移入回收站（可恢复），与项目批量删除同一套机制。"""
+        size = detect.fmt_size(addon.size_bytes)
+        warn = ("\n\n这是 Blender 发行包自带的插件，卸载后可能影响 Blender 自带功能。"
+                if addon.builtin else "")
+        if not confirm(
+            self, "卸载插件",
+            f"确定卸载「{addon.name}」（Blender {addon.blender_ver} · {size}）吗？"
+            f"\n{addon.path}{warn}\n\n"
+            "不会永久删除，移入回收站后可随时恢复。",
+            ok_text="移入回收站",
+        ):
+            return
+        ok, msg = ops.recycle_paths([addon.path])
+        if not ok:
+            self.window().show_toast(f"卸载失败：{msg}", "error")
+            return
+        self.window().rescan()
+        self.window().show_toast(
+            f"已卸载 {addon.name}（{size} 移入回收站，可恢复）", "ok")
 
     def _kick_store_once(self) -> None:
         """本地目录为空时后台静默拉取一次，供本地卡片匹配在线缩略图。"""
@@ -1498,15 +1592,11 @@ class AddonsPage(QWidget):
         return True
 
     def _is_installed(self, addon: StoreAddon) -> bool:
-        name = addon.name.strip().lower()
-        if not name:
+        # 与 find_local 同一套归一化匹配：封面图和「已安装」角标不能各说各话。
+        key = norm_name(addon.name)
+        if len(key) < 3:
             return False
-        for local in self._installed_names:
-            if local == name:
-                return True
-            if len(name) >= 4 and (name in local or local in name):
-                return True
-        return False
+        return any(match_norm(key, local) for local in self._installed_names)
 
     def _reload_online(self) -> None:
         st = self._store
@@ -1536,10 +1626,8 @@ class AddonsPage(QWidget):
             shown = shown[:_ONLINE_CAP]
         self._header.set_sub(sub)
 
-        _clear_layout(self._grid)
+        self._grid.reset()
         self._store_cards = []
-        self._grid_widgets = []
-        self._empty = None
         need_thumbs: list[StoreAddon] = []
         if not shown:
             if st is not None and st.refreshing:
@@ -1549,8 +1637,7 @@ class AddonsPage(QWidget):
                     "暂无在线插件", "点右上角「刷新」从 BudecoTop 拉取插件目录")
             else:
                 empty = EmptyState("没有匹配的插件", "换个关键词或分类试试")
-            self._empty = empty
-            self._arrange_grid(force=True)
+            self._grid.rebuild(empty)
             return
         for i, a in enumerate(shown):
             installed = self._is_installed(a)
@@ -1577,10 +1664,9 @@ class AddonsPage(QWidget):
                 need_thumbs.append(a)
             card.clicked.connect(
                 lambda _c=False, x=a, p=tp: self._open_detail(x, p))
-            card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            self._grid_widgets.append(card)
+            self._grid.add(card)
             self._store_cards.append((card, a))
-        self._arrange_grid(force=True)
+        self._grid.rebuild()
         self._queue_thumbs(st, need_thumbs)
 
     def _open_detail(self, addon: StoreAddon, thumb_path: str) -> None:

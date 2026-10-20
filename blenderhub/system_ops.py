@@ -158,6 +158,22 @@ def open_dir_or_fallback(path: str) -> tuple[bool, str]:
     return False, "未找到安装目录"
 
 
+def is_under(root: str, target: str) -> bool:
+    """target 是否严格位于 root 之内（解析软链、忽略大小写；跨盘符判 False）。
+
+    卸载保护用它：只有本应用安装目录之内的东西才允许删，
+    Program Files / Steam / 手动解压的一律判在外部。
+    """
+    if not root or not target:
+        return False
+    try:
+        r = os.path.realpath(root)
+        t = os.path.realpath(target)
+        return t != r and os.path.commonpath([r, t]) == r
+    except (ValueError, OSError):     # ValueError：不同盘符没有公共路径
+        return False
+
+
 def _recycle_win(paths: list[str]) -> tuple[bool, str]:
     """Windows：SHFileOperationW + FOF_ALLOWUNDO 移入回收站（可恢复）。"""
     import ctypes

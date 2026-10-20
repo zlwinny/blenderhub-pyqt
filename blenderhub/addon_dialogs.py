@@ -15,19 +15,31 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
+    QComboBox,
     QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
+    QScrollArea,
     QVBoxLayout,
+    QWidget,
 )
 
+from . import detect
 from . import native_dialog as ND
 from . import theme as T
 from .addon_store import OAUTH_URL, DownloadWatcher, StoreAddon
-from .widgets import Button, _rounded_cover, label
+from .blender_releases import (
+    MIRRORS,
+    BlenderInstaller,
+    Release,
+    ReleaseDownloader,
+    ReleaseIndex,
+)
+from .widgets import Button, Chip, ElidedLabel, _rounded_cover, label
 
 
 def _dlg_qss() -> str:
@@ -42,10 +54,29 @@ def _dlg_qss() -> str:
     )
 
 
-def _frame_qss() -> str:
+def _frame_qss(name: str = "panel") -> str:
+    """面板底色。必须用 QFrame#name 限定：裸规则会连子控件一起描边、上色。"""
     t = T.theme()
-    return (f"background: {t.bg_surface}; border: 1px solid {t.border}; "
-            f"border-radius: 12px;")
+    return (f"QFrame#{name} {{ background: {t.bg_surface}; "
+            f"border: 1px solid {t.border}; border-radius: 12px; }}")
+
+
+def _picker_qss() -> str:
+    """在线版本对话框特有控件（下拉、进度条）的配色，全局 QSS 里没有这两类。"""
+    t = T.theme()
+    font = 'font-family: "Noto Sans SC", "Microsoft YaHei";'
+    return (
+        f"QComboBox {{ background: {t.bg_surface}; border: 1px solid {t.border}; "
+        f"border-radius: 8px; padding: 5px 10px; color: {t.text_1}; {font} }}"
+        f"QComboBox:hover {{ border-color: {t.border_strong}; }}"
+        f"QComboBox:focus {{ border: 1px solid {t.brand}; }}"
+        f"QComboBox QAbstractItemView {{ background: {t.bg_raised}; "
+        f"border: 1px solid {t.border}; color: {t.text_1}; "
+        f"selection-background-color: {t.brand}; selection-color: {t.on_brand}; }}"
+        f"QProgressBar {{ background: {t.bg_surface}; border: 1px solid {t.border}; "
+        f"border-radius: 6px; text-align: center; color: {t.text_2}; }}"
+        f"QProgressBar::chunk {{ background: {t.brand}; border-radius: 5px; }}"
+    )
 
 
 class StoreLoginDialog(QDialog):
@@ -65,6 +96,7 @@ class StoreLoginDialog(QDialog):
         lay.addWidget(label(
             "BudecoTop 的插件下载需要登录。推荐两种方式：", "muted"))
         steps = QFrame(self)
+        steps.setObjectName("panel")
         steps.setStyleSheet(_frame_qss())
         sl = QVBoxLayout(steps)
         sl.setContentsMargins(10, 10, 10, 10)
@@ -177,6 +209,7 @@ class PanDownloadDialog(QDialog):
             "muted"))
 
         url_box = QFrame(self)
+        url_box.setObjectName("panel")
         url_box.setStyleSheet(_frame_qss())
         ul = QVBoxLayout(url_box)
         ul.setContentsMargins(10, 10, 10, 10)
@@ -379,6 +412,201 @@ class StoreDetailDialog(QDialog):
         lay.addLayout(act)
 
 
+class ReleasePickerDialog(QDialog):
+    """在线添加 Blender 版本：选镜像 → 拉列表 → 下载（续传 + SHA-256）→ 解包。
+
+    解包目标就是设置里的安装目录；成功后只发信号，登记托管目录与重扫由页面做。
+    """
+
+    installed = pyqtSignal(str, str)      # (version, dest_root)
+    import_requested = pyqtSignal()       # 用户改走「本地导入压缩包」
+
+    def __init__(self, install_dir: str, parent=None):
+        super().__init__(parent)
+        self._install_dir = install_dir
+        self._busy = False
+        self._pending: Release | None = None
+        self.setWindowTitle("添加 Blender 版本")
+        self.setMinimumWidth(640)
+        self.setStyleSheet(_dlg_qss() + _picker_qss())
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 16, 18, 14)
+        lay.setSpacing(10)
+        lay.addWidget(label("添加 Blender 版本", "h1"))
+        lay.addWidget(label(
+            f"从镜像站选择版本，下载后解包到：{install_dir}\n"
+            "支持断点续传；下载完成按官方 SHA-256 清单校验，校验不过直接丢弃。",
+            "muted"))
+
+        bar = QHBoxLayout()
+        bar.setSpacing(8)
+        self._mirror = QComboBox(self)
+        for name, url in MIRRORS:
+            self._mirror.addItem(name, url)
+        self._mirror.currentIndexChanged.connect(lambda _i: self._load(False))
+        bar.addWidget(self._mirror)
+        self._refresh_btn = Button("刷新列表", "secondary", "sm", icon_name="update")
+        self._refresh_btn.clicked.connect(lambda: self._load(True))
+        bar.addWidget(self._refresh_btn)
+        bar.addStretch(1)
+        local_btn = Button("本地导入压缩包…", "ghost", "sm", icon_name="folder")
+        local_btn.clicked.connect(self._want_local)
+        bar.addWidget(local_btn)
+        lay.addLayout(bar)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        inner = QWidget()
+        self._list_lay = QVBoxLayout(inner)
+        self._list_lay.setContentsMargins(0, 0, 8, 0)
+        self._list_lay.setSpacing(8)
+        self._list_lay.addWidget(label("正在获取在线版本列表…", "muted"))
+        self._list_lay.addStretch(1)
+        scroll.setWidget(inner)
+        lay.addWidget(scroll, 1)
+
+        prog = QHBoxLayout()
+        prog.setSpacing(8)
+        self._bar = QProgressBar(self)
+        self._bar.setRange(0, 100)
+        self._bar.setTextVisible(False)
+        self._bar.setFixedWidth(180)
+        self._bar.setVisible(False)
+        prog.addWidget(self._bar)
+        self._status = label("", "muted")
+        prog.addWidget(self._status, 1)
+        self._cancel_btn = Button("取消", "ghost", "sm")
+        self._cancel_btn.clicked.connect(self._cancel)
+        self._cancel_btn.setVisible(False)
+        prog.addWidget(self._cancel_btn)
+        lay.addLayout(prog)
+
+        foot = QHBoxLayout()
+        foot.addStretch(1)
+        close_btn = Button("关闭", "secondary")
+        close_btn.clicked.connect(self.reject)
+        foot.addWidget(close_btn)
+        lay.addLayout(foot)
+
+        self._index = ReleaseIndex(self)
+        self._index.loaded.connect(self._on_loaded)
+        self._dl = ReleaseDownloader(self)
+        self._dl.progress.connect(self._on_progress)
+        self._dl.finished.connect(self._on_dl_done)
+        self._installer = BlenderInstaller(self)
+        self._installer.progress.connect(
+            lambda text: self._status.setText(text))
+        self._installer.finished.connect(self._on_inst_done)
+        self._load(False)
+
+    # -- 列表 --------------------------------------------------------
+    def _load(self, force: bool) -> None:
+        self._clear_rows()
+        self._status.setText("")
+        self._list_lay.insertWidget(
+            0, label("正在获取在线版本列表…", "muted"), 0)
+        self._index.refresh(self._mirror.currentData(), force)
+
+    def _clear_rows(self) -> None:
+        while self._list_lay.count():
+            item = self._list_lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+
+    def _on_loaded(self, rels: list, err: str) -> None:
+        self._clear_rows()
+        if err:
+            self._status.setText(err)
+        if not rels:
+            self._list_lay.addWidget(label(
+                "没有取到在线版本。可以换个镜像，或用上方「本地导入压缩包」。",
+                "muted"))
+        for rel in rels:
+            self._list_lay.addWidget(self._make_row(rel))
+        self._list_lay.addStretch(1)
+
+    def _make_row(self, rel: Release) -> QWidget:
+        box = QFrame(self)
+        box.setObjectName("panel")
+        box.setStyleSheet(_frame_qss())
+        row = QHBoxLayout(box)
+        row.setContentsMargins(12, 10, 12, 10)
+        row.setSpacing(8)
+        row.addWidget(label(f"Blender {rel.version}", "h2"))
+        if rel.is_lts:
+            row.addWidget(Chip("LTS", "success"))
+        meta = " · ".join(x for x in (
+            detect.fmt_size(rel.size_bytes) if rel.size_bytes else "",
+            rel.date[:10], rel.mirror) if x)
+        # 用省略标签：行宽不够时截断而不是把「下载并安装」挤出可视区
+        row.addWidget(ElidedLabel(meta, "muted"), 1)
+        btn = Button("下载并安装", "primary", "sm", icon_name="download")
+        btn.clicked.connect(lambda _c=False, r=rel: self._download(r))
+        row.addWidget(btn)
+        return box
+
+    # -- 下载 / 解包 -------------------------------------------------
+    def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        self._bar.setVisible(busy)
+        self._cancel_btn.setVisible(busy)
+        self._mirror.setEnabled(not busy)
+        self._refresh_btn.setEnabled(not busy)
+        for i in range(self._list_lay.count()):
+            w = self._list_lay.itemAt(i).widget()
+            if w is None:
+                continue
+            for b in w.findChildren(Button):
+                b.setEnabled(not busy)
+
+    def _download(self, rel: Release) -> None:
+        if self._busy:
+            return
+        self._pending = rel
+        self._set_busy(True)
+        self._bar.setValue(0)
+        self._status.setText(f"正在下载 Blender {rel.version}…")
+        self._dl.start(rel)
+
+    def _on_progress(self, pct: int, text: str) -> None:
+        self._bar.setValue(pct)
+        self._status.setText(text)
+
+    def _cancel(self) -> None:
+        self._dl.cancel()
+        self._status.setText("正在取消…")
+
+    def _on_dl_done(self, ok: bool, msg: str, zip_path: str) -> None:
+        if not ok:
+            self._set_busy(False)
+            self._status.setText(msg)
+            return
+        self._bar.setRange(0, 0)          # 解包没有可靠的百分比来源，走忙碌条
+        self._status.setText(f"{msg} · 正在解包…")
+        self._installer.start(zip_path, self._install_dir)
+
+    def _on_inst_done(self, ok: bool, msg: str, dest: str) -> None:
+        self._bar.setRange(0, 100)
+        self._bar.setValue(0)
+        self._set_busy(False)
+        rel, self._pending = self._pending, None
+        if not ok:
+            self._status.setText(msg)
+            return
+        self.accept()
+        if rel is not None:
+            self.installed.emit(rel.version, dest)
+
+    def _want_local(self) -> None:
+        self.import_requested.emit()
+        self.reject()
+
+
 def confirm(parent, title: str, text: str,
             ok_text: str = "仍要安装", cancel_text: str = "取消") -> bool:
     """主题化确认框（可执行载荷等风险场景 / 批量删除等破坏性操作）。"""
@@ -387,9 +615,22 @@ def confirm(parent, title: str, text: str,
     box.setText(text)
     box.setIcon(QMessageBox.Icon.Warning)
     yes = box.addButton(ok_text, QMessageBox.ButtonRole.AcceptRole)
-    box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+    box.addButton(cancel_text, QMessageBox.ButtonRole.RejectRole)
     box.setStyleSheet(_dlg_qss() +
                       f"QMessageBox {{ background: {T.theme().bg_raised}; }}"
                       f"QPushButton {{ min-width: 72px; }}")
     box.exec()
     return box.clickedButton() is yes
+
+
+def notice(parent, title: str, text: str, ok_text: str = "知道了") -> None:
+    """主题化提示框（只告知不询问）：用于「外部安装不代删」这类拒绝场景。"""
+    box = QMessageBox(parent)
+    box.setWindowTitle(title)
+    box.setText(text)
+    box.setIcon(QMessageBox.Icon.Information)
+    box.addButton(ok_text, QMessageBox.ButtonRole.AcceptRole)
+    box.setStyleSheet(_dlg_qss() +
+                      f"QMessageBox {{ background: {T.theme().bg_raised}; }}"
+                      f"QPushButton {{ min-width: 72px; }}")
+    box.exec()

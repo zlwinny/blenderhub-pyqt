@@ -27,6 +27,12 @@ python main.py
 
 产物在 `dist/`，单目录免安装。
 
+## 诊断
+
+未处理异常始终落 `%TEMP%\blenderhub_crash.log`。需要更细的启动线索时，用
+`$env:BLENDERHUB_DEBUG = "1"` 再启动，额外写启动检查点 `blenderhub_start.log`
+与图标/字体快照 `blenderhub_diag.log`（逐像素扫描有开销，默认关闭）。
+
 ## 目录结构
 
 ```

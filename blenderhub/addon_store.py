@@ -89,6 +89,31 @@ _CATEGORY_RULES: list[tuple[str, tuple[str, ...]]] = [
     ("导入导出", ("import", "export", "io", "format", "导入", "导出", "格式")),
 ]
 
+# Blender manifest 的 bl_info["category"]（英文）→ 上面的统一分类词表。
+# 只映射含义确定的；3D View、Interface、Node 这类 Blender 自身的杂项桶保留原文，
+# 免得被抹平成「其他」后本地筛选比在线更没信息量。
+_MANIFEST_CATEGORY: dict[str, str] = {
+    "import-export": "导入导出",
+    "mesh": "建模", "add mesh": "建模", "add curve": "建模", "curve": "建模",
+    "sculpt": "雕刻", "paint": "雕刻",
+    "render": "渲染", "material": "渲染", "lighting": "渲染", "output": "渲染",
+    "animation": "动画", "rigging": "动画", "tracking": "动画",
+}
+
+# 扩展 / 插件包自带的泛化分类标记，等同没有分类
+_GENERIC_CATEGORY = frozenset({"", "扩展", "other", "utils"})
+
+UNCLASSIFIED_CATEGORY = "其他"
+
+
+def canonical_category(raw: str) -> str:
+    """把任意来源的插件分类归到统一词表（本地 manifest 与在线目录共用一套标签）。"""
+    key = (raw or "").strip().lower()
+    if key in _GENERIC_CATEGORY:
+        return UNCLASSIFIED_CATEGORY
+    return _MANIFEST_CATEGORY.get(key, (raw or "").strip())
+
+
 _TAG_RULES: list[tuple[str, tuple[str, ...]]] = [
     ("建模", ("建模", "model", "mesh", "boolean", "拓扑", "retopo")),
     ("渲染", ("渲染", "render", "材质", "material", "shader", "灯光", "light", "纹理", "贴图")),
@@ -861,6 +886,18 @@ def norm_name(name: str) -> str:
     return s
 
 
+def match_norm(a: str, b: str) -> bool:
+    """归一化插件名是否指向同一个插件：精确相等，或互相包含。
+
+    包含要求双方长度都不小于 4：io、uv 这类短名互相包含会大面积误命中。
+    """
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return len(a) >= 4 and len(b) >= 4 and (a in b or b in a)
+
+
 class _FetchTask(QRunnable):
     """后台爬取 budeco.top 目录（不含缩略图，缩略图在 catalog 就绪后补）。"""
 
@@ -1033,13 +1070,10 @@ class AddonStore(QObject):
         best, best_len = None, 0
         for a in self.addons:
             nk = norm_name(a.name)
-            if not nk:
-                continue
             if nk == key:
                 return a
-            if len(nk) >= 4 and len(key) >= 4 and (nk in key or key in nk):
-                if len(nk) > best_len:
-                    best, best_len = a, len(nk)
+            if match_norm(key, nk) and len(nk) > best_len:
+                best, best_len = a, len(nk)
         return best
 
     # -- 后台刷新 -------------------------------------------------------

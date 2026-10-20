@@ -15,6 +15,7 @@ from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import QApplication, QLabel, QPushButton
 
 from blenderhub import detect
+from blenderhub import blender_releases as br
 from blenderhub import icons as I
 from blenderhub import store
 from blenderhub import system_ops as ops
@@ -250,7 +251,7 @@ def main() -> None:
         check("批量删除：选中后按钮显示计数且可点击",
               "删除所选（1）" in projects._del_btn.text()
               and projects._del_btn.isEnabled())
-        projects._select_all_visible()
+        projects._toggle_select_all_visible()
         n_vis = sum(1 for c, *_ in projects._cards if not c.isHidden())
         check("批量删除：全选覆盖当前可见卡片", len(projects._sel) == n_vis,
               f"sel={len(projects._sel)} vis={n_vis}")
@@ -315,7 +316,7 @@ def main() -> None:
     check("在线模式分类为 BudecoTop 分类表",
           addons._store_categories == CATEGORY_CHIPS,
           str(addons._store_categories))
-    it = addons._grid.itemAtPosition(0, 0)
+    it = addons._grid.grid.itemAtPosition(0, 0)
     check("在线模式空目录展示空态卡片（不崩）",
           it is not None and it.widget() is not None)
     addons._search.setText("不存在的关键词xyz")
@@ -382,20 +383,64 @@ def main() -> None:
     wdir = tempfile.mkdtemp(prefix="bh_watch_")
     watcher = DownloadWatcher(dirs=[wdir], timeout_s=10)
     got: list[str] = []
+    timed_out: list[int] = []
     watcher.found.connect(got.append)
+    watcher.timeout.connect(lambda: timed_out.append(1))
     try:
         watcher.start()
         zp = os.path.join(wdir, "addon_test.zip")
         with zipfile.ZipFile(zp, "w", zipfile.ZIP_STORED) as zf:
             zf.writestr("a/__init__.py", "x" * 20000)
-        end = time.time() + 8
+        # 守望要 3 个轮询周期（1s tick + 1.5s 稳定窗）；整机忙时事件循环会被拖慢，
+        # 窗口给到 15s，避免把「慢」误判成「坏」
+        end = time.time() + 15
+        t0 = time.time()
         while time.time() < end and not got:
             QTest.qWait(200)
             app.processEvents()
-        check("下载守望自动拾取新 zip", bool(got), str(got[:1]))
+        check("下载守望自动拾取新 zip", bool(got),
+              f"got={got[:1]} timed_out={timed_out} running={watcher.running} "
+              f"waited={time.time() - t0:.1f}s size={os.path.getsize(zp)}")
     finally:
         watcher.stop()
         _shutil.rmtree(wdir, ignore_errors=True)
+
+    # 在线版本目录：两种 autoindex 排版都要能解析出体积与日期（离线样本，不联网）
+    nginx = ('<tr><td colspan="2" class="link">'
+             '<a href="blender-4.5.14-windows-x64.zip" title="t">'
+             'blender-4.5.14-windows-x64.zip</a></td>'
+             '<td class="size">380.2 MiB</td>'
+             '<td class="date">2026-09-15 17:21:53</td></tr>')
+    apache = ('<a href="blender-4.5.9-windows-x64.zip">'
+              'blender-4.5.9-windows-x64.zip</a>   17-Apr-2026 15:39   '
+              '399000000')
+    rows = br._parse_rows(nginx)
+    rows2 = br._parse_rows(apache)
+    check("在线目录解析支持 nginx 排版（体积换算 + 日期）",
+          abs(rows["blender-4.5.14-windows-x64.zip"][0] - 380.2 * 1048576) < 2
+          and rows["blender-4.5.14-windows-x64.zip"][1].startswith("2026-09-15"),
+          str(rows))
+    check("在线目录解析支持 apache 排版（字节 + 日期）",
+          rows2.get("blender-4.5.9-windows-x64.zip") == (399000000, "17-Apr-2026 15:39"),
+          str(rows2))
+    check("补丁号按数值排序（4.5.14 排在 4.5.9 之后）",
+          br.ver_key("4.5.14") > br.ver_key("4.5.9"))
+    check("SHA-256 清单按文件名取哈希",
+          br._pick_sha("aaaa  blender-4.5.14-windows-x64.zip\nbbbb  other.zip\n",
+                       "blender-4.5.14-windows-x64.zip") == "aaaa")
+
+    # 版本卸载护栏：只有装进托管安装目录的副本才允许删
+    # （第一版曾因对扫描结果直接 rmtree 误删 Program Files / Steam 里的 Blender）
+    guard_root = tempfile.mkdtemp(prefix="bh_guard_")
+    guard_in = os.path.join(guard_root, "blender-9.9.9-windows-x64")
+    os.makedirs(guard_in)
+    check("卸载护栏：托管目录之内判为可删", ops.is_under(guard_root, guard_in))
+    check("卸载护栏：目录自身与外部路径判为不可删",
+          not ops.is_under(guard_root, guard_root)
+          and not ops.is_under(guard_root, tempfile.gettempdir())
+          and not ops.is_under("", guard_in),
+          f"root={guard_root}")
+    _shutil.rmtree(guard_root, ignore_errors=True)
 
     vers = blender_user_versions()
     check("Blender 用户版本目录可枚举",
