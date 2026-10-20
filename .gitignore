@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.egg-info/
+
+# 打包产物（PyInstaller）
+build/
+dist/
+_internal/
+*.exe
+*.msi
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 工具缓存与诊断产物
+.ruff_cache/
+tools/**/_out/
+tools/**/_decomp/
+tools/**/_t2_cache/
+_tmp/
+*.log
+*.part
+
+# Agent 记忆（项目知识存档，非源码）
+.codebuddy/
+
+# IDE：settings.json 只含本机解释器绝对路径，换机器即失效
+.vscode/settings.json
+
+# Agent 记忆（项目知识存档，非源码；想备份就删掉这一行）
+.workbuddy/
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini

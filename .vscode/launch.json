@@ -1,0 +1,31 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "BlenderHub（源码启动）",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "cwd": "${workspaceFolder}",
+      "python": "C:\\Users\\ZL Ultra7 270K\\AppData\\Local\\Programs\\Python\\Python314\\python.exe",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONUTF8": "1"
+      }
+    },
+    {
+      "name": "当前脚本（tools 下调试用）",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "cwd": "${workspaceFolder}",
+      "python": "C:\\Users\\ZL Ultra7 270K\\AppData\\Local\\Programs\\Python\\Python314\\python.exe",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONUTF8": "1"
+      }
+    }
+  ]
+}
